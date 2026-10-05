@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>离线航迹交换站 · 写时复制 B+ 树索引复核台</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>离线航迹交换站</h1>
+    <p class="subtitle">阶数 4 B+ 树 · 路径写时复制 · 三阶段持久化（新页 → 意图 → 根指针）· IndexedDB</p>
+  </header>
+
+  <section id="recovery-banner" class="banner hidden" aria-live="polite"></section>
+
+  <main class="layout">
+    <!-- 左栏：录入与批次 -->
+    <div class="column">
+      <section class="card" id="init-card">
+        <h2>1 · 初始航点录入</h2>
+        <p class="hint">至多 <strong>24</strong> 个互异整数键与短文本载荷，每行一条：<code>键,载荷</code></p>
+        <textarea id="init-input" rows="6" placeholder="10,航点十&#10;20,航点廿&#10;30,卅"></textarea>
+        <div class="row">
+          <button id="btn-init" class="primary">建立代次 1 索引</button>
+          <button id="btn-sample" class="ghost">填入示例</button>
+          <span class="counter"><span id="init-count">0</span>/24</span>
+        </div>
+      </section>
+
+      <section class="card" id="batch-card">
+        <h2>2 · 批次编辑</h2>
+        <p class="hint">稳定批次标识 + 至多 <strong>12</strong> 项顺序脚本（插入 / 更新 / 删除）</p>
+        <label class="field">
+          <span>批次标识</span>
+          <input id="batch-id" type="text" maxlength="64" placeholder="例如 batch-20261005-01" />
+        </label>
+        <table class="edit-table" id="edit-table">
+          <thead><tr><th>操作</th><th>整数键</th><th>短文本载荷</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="row">
+          <button id="btn-add-edit" class="ghost">＋ 增加一项</button>
+          <span class="counter"><span id="edit-count">0</span>/12</span>
+        </div>
+
+        <h3>断电演练（可选）</h3>
+        <label class="field">
+          <span>在此持久化阶段之后中断</span>
+          <select id="crash-point">
+            <option value="none">不中断，正常提交</option>
+            <option value="during-pages">阶段1 · 新页写入途中</option>
+            <option value="after-pages">阶段1 · 新页全部写完、意图留下前</option>
+            <option value="after-intent">阶段2 · 意图已持久化、根切换前</option>
+            <option value="after-root">阶段3 · 根已切换、意图清理前</option>
+          </select>
+        </label>
+        <div class="row wrap">
+          <button id="btn-submit" class="primary">提交批次</button>
+          <button id="btn-reopen">⏻ 断电后重开复核</button>
+          <button id="btn-lookup" class="ghost">按键查询</button>
+          <input id="lookup-key" type="number" placeholder="查询键" class="small-input" />
+          <button id="btn-reset" class="danger ghost">抹库重来</button>
+        </div>
+        <p class="hint">刷新本页等同于“断电后重开”：系统只依据已持久化证据停在旧根或发布完整新根。</p>
+      </section>
+
+      <section class="card" id="receipt-card">
+        <h2>最近回执</h2>
+        <pre id="receipt-out" class="receipt">（尚无操作）</pre>
+      </section>
+    </div>
+
+    <!-- 右栏：结果页 -->
+    <div class="column wide">
+      <section class="card result-head">
+        <h2>3 · 结果页</h2>
+        <div class="badges">
+          <div class="badge"><span class="badge-label">根代次</span><strong id="r-gen">—</strong></div>
+          <div class="badge"><span class="badge-label">可达页</span><strong id="r-pages">—</strong></div>
+          <div class="badge"><span class="badge-label">内部 / 叶页</span><strong id="r-kinds">—</strong></div>
+          <div class="badge"><span class="badge-label">键总数</span><strong id="r-keys">—</strong></div>
+          <div class="badge" id="r-order-badge"><span class="badge-label">叶序</span><strong>—</strong></div>
+          <div class="badge" id="r-once-badge"><span class="badge-label">每键恰好一次</span><strong>—</strong></div>
+        </div>
+        <div class="rootline">当前根指针：<code id="r-rootid">—</code></div>
+      </section>
+
+      <section class="card">
+        <h2>4 · 分裂审计：所有键是否仍恰好一次</h2>
+        <div id="audit-out" class="audit"></div>
+      </section>
+
+      <section class="card">
+        <h2>5 · 按键有序的叶序列</h2>
+        <p class="hint">不同底色代表不同叶页；审查员可直观看到分裂后每个键仅落在唯一一个叶页。</p>
+        <div id="leafseq" class="leafseq"></div>
+      </section>
+
+      <section class="card">
+        <h2>6 · 可达页与树结构（含代次与摘要）</h2>
+        <div id="pages-out" class="pages"></div>
+      </section>
+    </div>
+  </main>
+
+  <script type="module" src="./app.mjs"></script>
+</body>
+</html>

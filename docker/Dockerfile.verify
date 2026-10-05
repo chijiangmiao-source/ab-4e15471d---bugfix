@@ -1,0 +1,5 @@
+FROM node:20-alpine
+WORKDIR /app
+COPY . /app
+# 不安装任何依赖：规则测试与构建全部使用 Node 内置能力
+CMD ["node", "verify/run-all.mjs"]

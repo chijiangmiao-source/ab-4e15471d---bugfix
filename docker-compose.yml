@@ -1,0 +1,27 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+    ports:
+      - "8080:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  # 验收容器：docker compose --profile verify run --rm verify
+  # 其退出码即结论（0 通过）。depends_on 保证 web 健康后才开始。
+  verify:
+    profiles: ["verify"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.verify
+    environment:
+      BASE_URL: "http://web"
+    depends_on:
+      web:
+        condition: service_healthy
+    command: ["node", "verify/run-all.mjs"]
