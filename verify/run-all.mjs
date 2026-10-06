@@ -17,8 +17,9 @@ let code = await run(process.execPath, [
   '--test',
   'verify/rules.test.mjs',
   'verify/idb.integration.test.mjs',
+  'verify/concurrency.test.mjs',
   'verify/dom.test.mjs',
-], '规则、IndexedDB 适配与页面控制层测试（node --test）');
+], '规则、IndexedDB 适配、并发批次与页面控制层测试（node --test）');
 if (code !== 0) process.exit(code);
 
 code = await run(process.execPath, ['verify/build.mjs'], '页面构建');
@@ -48,5 +49,5 @@ code = await new Promise((resolve) => {
 });
 if (code !== 0) process.exit(code);
 
-console.log('\n✅ verify 全项通过：规则、分裂、阶段恢复、冲突重传、构建与 HTTP 冒烟');
+console.log('\n✅ verify 全项通过：规则、分裂、阶段恢复、并发批次、冲突重传、构建与 HTTP 冒烟');
 process.exit(0);

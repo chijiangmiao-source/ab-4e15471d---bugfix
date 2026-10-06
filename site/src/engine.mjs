@@ -11,6 +11,7 @@ import {
   applyEdits, buildTree, closure, orderedLeaves, RuleError, ORDER,
 } from './bptree.mjs';
 import { fnv1a64, stableStringify, verifyDigest } from './digest.mjs';
+import { K_COMMIT_LOCK } from './store.mjs';
 
 export const CRASH_POINTS = Object.freeze({
   NONE: 'none',
@@ -19,6 +20,13 @@ export const CRASH_POINTS = Object.freeze({
   AFTER_INTENT: 'after-intent',
   AFTER_ROOT: 'after-root', // 根已切换、回执已固化，尚未清理意图
 });
+
+// 跨连接提交租约：把“写新页 → 意图 → 切根 → 回收”串行化为临界区。
+// TTL 只在持约连接真正死亡（断电/杀进程）后生效，由重开复核或等待方回收；
+// 正常提交远短于 TTL。等待超时后给调用方“可重试”结论而非任何半状态。
+const COMMIT_LOCK_TTL_MS = 20_000;
+const LEASE_WAIT_MS = 25_000;
+const LEASE_POLL_MS = 25;
 
 const K_ROOT = 'root';
 const K_INTENT = 'intent';
@@ -104,9 +112,17 @@ function validateInitial(entries) {
 function MAX_TEXT_TEXT_HINT() { return MAX_TEXT; }
 
 export class Engine {
-  constructor(store, { now = () => new Date().toISOString() } = {}) {
+  constructor(store, {
+    now = () => new Date().toISOString(),
+    nowMs = () => Date.now(),
+    leaseTtlMs = COMMIT_LOCK_TTL_MS,
+    leaseWaitMs = LEASE_WAIT_MS,
+  } = {}) {
     this.store = store;
     this.now = now;
+    this.nowMs = nowMs;
+    this.leaseTtlMs = leaseTtlMs;
+    this.leaseWaitMs = leaseWaitMs;
     this.state = null; // { rootId, gen, pages:Map, receipt? }
   }
 
@@ -129,16 +145,6 @@ export class Engine {
     return src;
   }
 
-  // 校验已发布树的引用闭合与摘要（recover 时已填充 corrupt/loadProblems）
-  verifyPublished() {
-    if (this.state?.corrupt?.length) {
-      throw new RuleError('CORRUPT_DIGEST', this.state.corrupt.join('；'));
-    }
-    if (this.state?.loadProblems?.length) {
-      throw new RuleError('BROKEN_REFERENCE', this.state.loadProblems.join('；'));
-    }
-  }
-
   async abandonIntent(payload, reason) {
     await this.store.delete(K_INTENT);
     await this.store.put(K_RECEIPT(payload.batchId), {
@@ -147,7 +153,82 @@ export class Engine {
     });
   }
 
+  // 持约等待：租约把整段三阶段提交（含新页写入与旧页回收）跨连接串行化。
+  // 他连接持约通常毫秒级完成，故等待方轮询到即可续跑；唯有持约者真正死亡
+  // （租约超过 TTL 未续）才由过期判定回收。waitMs 内仍拿不到则返回 false。
+  async acquireLease(holder, { waitMs = this.leaseWaitMs } = {}) {
+    const deadline = this.nowMs() + waitMs;
+    for (;;) {
+      const r = await this.store.acquireCommitLease(holder, this.leaseTtlMs, this.nowMs());
+      if (r.ok) return true;
+      if (this.nowMs() >= deadline) return false;
+      await new Promise((res) => setTimeout(res, LEASE_POLL_MS));
+    }
+  }
+
+  async releaseLease(holder) {
+    try { await this.store.releaseCommitLease(holder); } catch { /* 释放是尽力而为 */ }
+  }
+
+  // 从持久化读取当前已发布根的完整快照（持约期间调用：此刻无并发提交者）。
+  // 发布根本身缺页/摘要损坏时返回 unhealthy 标记，调用方据此拒绝改根。
+  async loadPublished() {
+    const rootRec = await this.store.get(K_ROOT);
+    if (!rootRec) {
+      return { rootRec: null, state: { rootId: null, gen: 0, pages: new Map(), keySet: new Set(), corrupt: [], loadProblems: [] } };
+    }
+    const pages = new Map();
+    const loadProblems = [];
+    try {
+      const m = await this.loadPages(rootRec.rootId);
+      for (const [id, p] of m) pages.set(id, p);
+    } catch (e) {
+      loadProblems.push(e.message);
+    }
+    const corrupt = [];
+    for (const p of pages.values()) {
+      if (!verifyDigest(p)) corrupt.push(`已发布页 ${p.id} 摘要不匹配`);
+    }
+    return {
+      rootRec,
+      state: {
+        rootId: rootRec.rootId, gen: rootRec.gen, pages,
+        keySet: new Set(rootRec.keys ?? []), corrupt, loadProblems,
+      },
+    };
+  }
+
   async recover() {
+    // 重开复核与提交互斥：先取提交租约（他连接在途提交通常毫秒级结束；
+    // 其真正死亡时租约在 TTL 后可被回收）。持约期间的一切发布/回收都安全。
+    const holder = leaseHolder('recover');
+    if (!(await this.acquireLease(holder))) {
+      return this.recoverReadOnly('另一连接正在提交批次，本轮仅做只读复核：不发布新根、不回收页，请稍后重开');
+    }
+    try {
+      return await this.recoverLocked();
+    } finally {
+      await this.releaseLease(holder);
+    }
+  }
+
+  // 他连接持约且 TTL 内未结束时的只读复核：只依据已发布根给结论，不做任何写入
+  async recoverReadOnly(note) {
+    const { rootRec, state } = await this.loadPublished();
+    this.state = state;
+    if (!rootRec) {
+      this.state.empty = true;
+      return this.recoveryReport('FRESH', '空库，尚无已发布根');
+    }
+    if (state.loadProblems.length || state.corrupt.length) {
+      return this.recoveryReport('PUBLISHED_ROOT_UNHEALTHY',
+        `已发布根（代次 ${rootRec.gen}）健康检查失败：${[...state.loadProblems, ...state.corrupt].join('；')}。冻结于该根。${note}`);
+    }
+    return this.recoveryReport('INTACT', `未发现未完成批次，查询视图即已发布根。${note}`);
+  }
+
+  // 调用方已持有提交租约
+  async recoverLocked() {
     const rootRec = await this.store.get(K_ROOT);
     const intent = await this.store.get(K_INTENT);
 
@@ -177,7 +258,7 @@ export class Engine {
     if (loadProblems.length || corrupt.length) {
       // 已发布根自身不可信：绝不自动改写，批次操作一律拒绝直到人工处理
       report = this.recoveryReport('PUBLISHED_ROOT_UNHEALTHY',
-        `已发布根（代次 ${rootRec.gen}）健康检查失败：${[...loadProblems, ...corrupt].join('；')}。冻结于该根，不发布任何新树`);
+        `已发布根（代次 ${rootRec.gen}）健康检查失败：${[...loadProblems, ...corrupt].join('；')}。冻结于该根，不发布任何新根`);
       if (intent) await this.abandonIntent(intent, '已发布根不健康，未竟意图不予执行');
     } else if (!intent) {
       report = this.recoveryReport('INTACT', '未发现未完成批次，查询视图即已发布根');
@@ -216,7 +297,8 @@ export class Engine {
     }
 
     if (problems.length === 0 && closureOk) {
-      // 证据完整：根指针（含键集合）与提交回执原子发布
+      // 证据完整：根指针（含键集合）与提交回执在同一事务原子发布；
+      // 调用方持提交租约，基准根在此期间不可能移动，CAS 再做一道防线。
       const receipt = await this.store.get(K_RECEIPT(intent.batchId));
       const writes = [[K_ROOT, {
         _id: K_ROOT, rootId: intent.rootId, gen: intent.gen,
@@ -225,7 +307,13 @@ export class Engine {
       if (!receipt || receipt.gen !== intent.gen) {
         writes.push([K_RECEIPT(intent.batchId), committedReceipt(intent, this.now())]);
       }
-      await this.store.putMany(writes);
+      const cas = await this.store.commitRootIf(
+        { rootId: this.state.rootId, gen: this.state.gen }, writes);
+      if (!cas.ok) {
+        // 理论上持约不会发生：保守退回，不发布、不回收，交下轮重开判定
+        return this.recoveryReport('OLD_ROOT_RETAINED',
+          `批次 ${intent.batchId} 发布时根基准已被他连接推进，本次不发布，请再次重开复核`);
+      }
       await this.store.delete(K_INTENT);
       this.state = {
         rootId: intent.rootId, gen: intent.gen, pages: newPages,
@@ -256,17 +344,29 @@ export class Engine {
   async initialize(entriesInput) {
     const entries = entriesInput.map(([k, v]) => [Number(k), String(v ?? '')]);
     validateInitial(entries);
-    if (this.state && this.state.rootId != null) {
-      throw new RuleError('ALREADY_INITIALIZED', '索引已初始化，不能重复录入初始航点');
+    const holder = leaseHolder('init');
+    if (!(await this.acquireLease(holder))) {
+      throw new RuleError('LEASE_BUSY', '另一连接正在提交批次，初始录入未能取得提交租约，请稍后重试');
     }
-    const gen = 1;
-    const { rootId, pages: pageMap } = buildTree(gen, entries);
-    const keys = entries.map(([k]) => k);
-    // 先全部新页，最后切根——与批次同一套写时复制纪律
-    for (const p of pageMap.values()) await this.store.put(K_PAGE(p.id), p);
-    await this.store.put(K_ROOT, { _id: K_ROOT, rootId, gen, keys });
-    this.state = { rootId, gen, pages: pageMap, keySet: new Set(keys), corrupt: [], loadProblems: [] };
-    return this.snapshot();
+    try {
+      const existing = await this.store.get(K_ROOT);
+      if (existing) {
+        throw new RuleError('ALREADY_INITIALIZED', '索引已初始化，不能重复录入初始航点');
+      }
+      const gen = 1;
+      const { rootId, pages: pageMap } = buildTree(gen, entries);
+      const keys = entries.map(([k]) => k);
+      // 先全部新页，最后在同一临界区切根——与批次同一套写时复制纪律
+      for (const p of pageMap.values()) await this.store.put(K_PAGE(p.id), p);
+      const cas = await this.store.commitRootIf({ rootId: null, gen: 0 }, [
+        [K_ROOT, { _id: K_ROOT, rootId, gen, keys }],
+      ]);
+      if (!cas.ok) throw new RuleError('ALREADY_INITIALIZED', '索引已被另一连接初始化，不能重复录入初始航点');
+      this.state = { rootId, gen, pages: pageMap, keySet: new Set(keys), corrupt: [], loadProblems: [] };
+      return this.snapshot();
+    } finally {
+      await this.releaseLease(holder);
+    }
   }
 
   // 清理指定根不可达的存储页（半写入孤儿 / 旧版本页），返回回收页数
@@ -287,6 +387,11 @@ export class Engine {
 
   // 提交（或重试）一个批次。crashAt 用于复核演练断电中断。
   // 所有规则违反一律以 rejected 回执返回且不写任何页，绝不抛异常给调用方。
+  //
+  // 跨连接并发：整段三阶段提交在持久化“提交租约”临界区内完成；持约后重读
+  // 当前已发布根作为基准（rebase），因此前一批先落盘后，本批会基于新根重算
+  // 并推进到下一代（两批都可 committed，如 gen 2 与 gen 3）。切根再用根指针
+  // CAS 兜底，保证 committed 回执必对应可闭合、可完整遍历的发布状态。
   async submitBatch(rawEdits, batchId, crashAt = CRASH_POINTS.NONE) {
     const editDigest = safeEditDigest(rawEdits);
     try {
@@ -297,88 +402,124 @@ export class Engine {
     }
     const edits = canonicalEdits(rawEdits);
 
-    // 同批次重传：等价编辑 -> 回放原回执；内容不同 -> 冲突拒绝
-    const prior = await this.store.get(K_RECEIPT(batchId));
-    if (prior) {
-      if (prior.editDigest !== editDigest) {
-        return rejectReceipt(batchId, editDigest, 'CONFLICT_BATCH_CONTENT',
-          `批次标识 ${batchId} 已用于不同内容的编辑（原摘要 ${prior.editDigest}），拒绝改写历史`);
-      }
-      return { ...prior, replayed: true };
+    const holder = leaseHolder('submit:' + batchId);
+    if (!(await this.acquireLease(holder))) {
+      // 他连接持约超过等待窗口仍未完成（真实崩溃由 TTL 回收，此处只可能是长事务）：
+      // 给出明确的“待恢复/可重试”结论，绝不基于可能过期的内存视图改根。
+      return retryReceipt(batchId, editDigest, 'LEASE_BUSY',
+        '另一连接的提交临界区长时间未结束，本批未写入；请重开复核后用同一批次标识重试');
     }
 
-    // 已发布树损坏保护：任何批次都不得改变不可信根
     try {
-      this.verifyPublished();
-    } catch (e) {
-      return rejectReceipt(batchId, editDigest, e.code, e.message);
-    }
-
-    const intent = await this.store.get(K_INTENT);
-    if (intent && intent.batchId === batchId) {
-      // 上次中断在同批次且尚无回执：等价编辑继续/完成它（走正常三阶段，内容寻址幂等覆盖）
-    } else if (intent) {
-      return rejectReceipt(batchId, editDigest, 'OTHER_BATCH_PENDING',
-        `尚有批次 ${intent.batchId} 未完成恢复判定，请先重开复核`);
-    }
-
-    const gen = this.state.gen + 1;
-    let result;
-    try {
-      result = applyEdits(this.state.pages, this.state.rootId, gen, edits);
-    } catch (e) {
-      if (e instanceof RuleError) return rejectReceipt(batchId, editDigest, e.code, e.message);
-      throw e;
-    }
-    // applyEdits 成功即代表全部编辑有效；计算提交后的已发布键集合（与根同事务落盘）
-    const nextKeys = [...keysAfter(this.state.keySet ?? new Set(), edits)].sort((a, b) => a - b);
-
-    const newPages = [...result.pages.values()];
-    const intentRec = {
-      batchId, editDigest, gen, rootId: result.rootId, keys: nextKeys,
-      pageIds: newPages.map((p) => p.id), createdAt: this.now(),
-    };
-
-    // 阶段 1：逐页持久化（崩溃可留下部分半写入页）
-    for (let i = 0; i < newPages.length; i++) {
-      await this.store.put(K_PAGE(newPages[i].id), newPages[i]);
-      if (crashAt === CRASH_POINTS.DURING_PAGES && i === 0) {
-        return crashAck(batchId, editDigest, gen, 'PAGES',
-          `断电于新页写入途中：${i + 1}/${newPages.length} 页已落盘，无意图、根未切换`);
+      // 同批次重传（持约后再判定，避免与在途提交竞态）：
+      // 等价编辑 -> 回放原回执；内容不同 -> 冲突拒绝
+      const prior = await this.store.get(K_RECEIPT(batchId));
+      if (prior) {
+        if (prior.editDigest !== editDigest) {
+          return rejectReceipt(batchId, editDigest, 'CONFLICT_BATCH_CONTENT',
+            `批次标识 ${batchId} 已用于不同内容的编辑（原摘要 ${prior.editDigest}），拒绝改写历史`);
+        }
+        return { ...prior, replayed: true };
       }
-    }
-    if (crashAt === CRASH_POINTS.AFTER_PAGES) {
-      return crashAck(batchId, editDigest, gen, 'PAGES',
-        `断电于新页全部写入后、意图留下前：${newPages.length} 页成为旧根不可达的孤儿候选`);
-    }
 
-    // 阶段 2：留下批次意图
-    await this.store.put(K_INTENT, intentRec);
-    if (crashAt === CRASH_POINTS.AFTER_INTENT) {
-      return crashAck(batchId, editDigest, gen, 'INTENT',
-        '断电于意图持久化后、根切换前：重开时凭页与意图证据决定发布或退回');
-    }
+      // 以持久化中的当前已发布根为唯一基准（而非可能过期的连接内存视图）
+      const { state: base } = await this.loadPublished();
+      this.state = base;
+      if (base.corrupt?.length || base.loadProblems?.length) {
+        const e = base.corrupt.length
+          ? new RuleError('CORRUPT_DIGEST', base.corrupt.join('；'))
+          : new RuleError('BROKEN_REFERENCE', base.loadProblems.join('；'));
+        return rejectReceipt(batchId, editDigest, e.code, e.message);
+      }
 
-    // 阶段 3：根指针（含键集合）与提交回执在同一事务原子固化（要么都生效要么都不生效）
-    await this.store.putMany([
-      [K_ROOT, { _id: K_ROOT, rootId: result.rootId, gen, keys: nextKeys }],
-      [K_RECEIPT(batchId), committedReceipt(intentRec, this.now())],
-    ]);
-    if (crashAt === CRASH_POINTS.AFTER_ROOT) {
-      return crashAck(batchId, editDigest, gen, 'COMMIT',
-        '断电于根切换后、意图清理前：新根已经是可查询视图，重开仅补清理');
-    }
-    await this.store.delete(K_INTENT);
-    // 回收旧版本页：新根不可达的页一律清除，任何时刻可查询视图只含当前根
-    const combined = this.allPagesAfter(result);
-    await this.gcUnreachable(combined, result.rootId);
+      const intent = await this.store.get(K_INTENT);
+      if (intent && intent.batchId !== batchId) {
+        return rejectReceipt(batchId, editDigest, 'OTHER_BATCH_PENDING',
+          `尚有批次 ${intent.batchId} 未完成恢复判定，请先重开复核`);
+      }
+      // intent.batchId === batchId：上次同批次中断、尚无回执的续做，
+      // 下面走正常三阶段；内容寻址使新页幂等覆盖。
 
-    this.state = { rootId: result.rootId, gen, pages: combined, keySet: new Set(nextKeys), corrupt: [], loadProblems: [] };
-    return { ...committedReceipt(intentRec, this.now()), replayed: false };
+      const baseRootId = base.rootId;
+      const baseGen = base.gen;
+      const gen = baseGen + 1;
+      let result;
+      try {
+        result = applyEdits(base.pages, baseRootId, gen, edits);
+      } catch (e) {
+        if (e instanceof RuleError) return rejectReceipt(batchId, editDigest, e.code, e.message);
+        throw e;
+      }
+      // applyEdits 成功即代表全部编辑有效；计算提交后的已发布键集合（与根同事务落盘）
+      const nextKeys = [...keysAfter(base.keySet ?? new Set(), edits)].sort((a, b) => a - b);
+
+      const newPages = [...result.pages.values()];
+      const intentRec = {
+        batchId, editDigest, gen, rootId: result.rootId, keys: nextKeys,
+        pageIds: newPages.map((p) => p.id), createdAt: this.now(),
+      };
+
+      // 阶段 1：逐页持久化（崩溃可留下部分半写入页）
+      for (let i = 0; i < newPages.length; i++) {
+        await this.store.put(K_PAGE(newPages[i].id), newPages[i]);
+        if (crashAt === CRASH_POINTS.DURING_PAGES && i === 0) {
+          return await this.interrupt(holder, crashAck(batchId, editDigest, gen, 'PAGES',
+            `断电于新页写入途中：${i + 1}/${newPages.length} 页已落盘，无意图、根未切换`));
+        }
+      }
+      if (crashAt === CRASH_POINTS.AFTER_PAGES) {
+        return await this.interrupt(holder, crashAck(batchId, editDigest, gen, 'PAGES',
+          `断电于新页全部写入后、意图留下前：${newPages.length} 页成为旧根不可达的孤儿候选`));
+      }
+
+      // 阶段 2：留下批次意图
+      await this.store.put(K_INTENT, intentRec);
+      if (crashAt === CRASH_POINTS.AFTER_INTENT) {
+        return await this.interrupt(holder, crashAck(batchId, editDigest, gen, 'INTENT',
+          '断电于意图持久化后、根切换前：重开时凭页与意图证据决定发布或退回'));
+      }
+
+      // 阶段 3：单事务 CAS——仅当根指针仍停在本批基准根时，才原子写入根与回执。
+      const cas = await this.store.commitRootIf(
+        { rootId: baseRootId, gen: baseGen },
+        [
+          [K_ROOT, { _id: K_ROOT, rootId: result.rootId, gen, keys: nextKeys }],
+          [K_RECEIPT(batchId), committedReceipt(intentRec, this.now())],
+        ],
+      );
+      if (!cas.ok) {
+        // 持约下理论上不会发生：保守处理为可重试冲突，绝不覆盖他连接已发布的根。
+        await this.store.delete(K_INTENT);
+        const fresh = await this.loadPublished();
+        this.state = fresh.state;
+        if (fresh.state.rootId != null) await this.gcUnreachable(fresh.state.pages, fresh.state.rootId);
+        return retryReceipt(batchId, editDigest, 'ROOT_ADVANCED',
+          `提交瞬间根基准已被他连接推进到代次 ${fresh.state.gen}，本批未改根；请基于新根重试`);
+      }
+      if (crashAt === CRASH_POINTS.AFTER_ROOT) {
+        return await this.interrupt(holder, crashAck(batchId, editDigest, gen, 'COMMIT',
+          '断电于根切换后、意图清理前：新根已经是可查询视图，重开仅补清理'));
+      }
+      await this.store.delete(K_INTENT);
+      // 回收旧版本页：新根不可达的页一律清除，任何时刻可查询视图只含当前根
+      const combined = this.allPagesAfter(base, result);
+      await this.gcUnreachable(combined, result.rootId);
+
+      this.state = { rootId: result.rootId, gen, pages: combined, keySet: new Set(nextKeys), corrupt: [], loadProblems: [] };
+      return { ...committedReceipt(intentRec, this.now()), replayed: false };
+    } finally {
+      await this.releaseLease(holder);
+    }
   }
 
-  allPagesAfter(result) {
-    const all = new Map(this.state.pages);
+  // 模拟断电：进程死亡后不再持有租约，故释放租约记录，其余持久化证据原样保留。
+  async interrupt(holder, ack) {
+    await this.releaseLease(holder);
+    return ack;
+  }
+
+  allPagesAfter(base, result) {
+    const all = new Map(base.pages);
     for (const [id, p] of result.pages) all.set(id, p);
     const w = { get: (id) => all.get(id) ?? null, out: new Map() };
     const keep = closure(w, result.rootId);
@@ -420,8 +561,20 @@ function rejectReceipt(batchId, editDigest, code, reason) {
   return { batchId, editDigest, status: 'rejected', code, reason, replayed: false };
 }
 
+// 可重试边界：本批未改根、未产生已发布状态，调用方可在重开复核后用同一批次标识重试
+function retryReceipt(batchId, editDigest, code, reason) {
+  return { batchId, editDigest, status: 'retryable', code, reason, replayed: false };
+}
+
 function crashAck(batchId, editDigest, gen, stage, note) {
   return { batchId, editDigest, status: 'interrupted', gen, stage, note, replayed: false };
+}
+
+// 每次临界区一个唯一持约标识（同一连接上的并发提交也互为不同持约者）
+let leaseSeq = 0;
+function leaseHolder(kind) {
+  leaseSeq += 1;
+  return `${kind}#${leaseSeq.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 // ---- 只读视图：根代次、可达页、有序叶序列、键恰好一次校验 ----

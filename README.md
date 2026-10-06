@@ -33,6 +33,14 @@
   新页或已发布页摘要损坏 `CORRUPT_DIGEST`；子页引用无法闭合 `BROKEN_REFERENCE`。
   所有拒绝都给出中文原因，且**不产生任何写入、不改变已发布根**。
 - 批次是顺序脚本：允许“先插入后更新/删除”同一键。
+- **多连接并发**：两个已打开页面/连接同时提交不同批次时，整段三阶段提交由一条持久化
+  “提交租约”（`commit-lock`，带 TTL，崩溃可恢复）跨连接互斥串行，切根再以根指针的
+  单事务比较并交换（CAS）兜底。因此两批不会都谎报同一代次：先落盘者基于旧根提交，
+  后到者**持约后重读已发布根并重基（rebase）**，在新根上推进到下一代——两批都可
+  `committed`（如 gen 2 与 gen 3），重开为健康完整根、两个新增键都可查询。
+  若等待窗口内始终无法取得租约（对端长事务），本批返回 `status: "retryable"`
+  （`LEASE_BUSY` / `ROOT_ADVANCED`），**不改根、不丢键**，重开复核后用同一批次标识重试即可。
+  任何 `committed` 回执都必对应可闭合、可完整遍历的发布状态。
 
 ## 三、结果页展示
 
@@ -56,8 +64,9 @@ echo $?                                       # 0 = 规则测试 + 页面构建 
 `verify` 容器位于 `verify` profile 下（故普通 `docker compose up` 只启动站点），
 在 `web` 健康后运行（`depends_on: service_healthy`）：
 
-1. `node --test`：26+ 项规则 / 集成 / 页面控制层测试（有效分裂、四个持久化阶段中断恢复、
-   冲突与等价重传、各类拒绝原因、损坏摘要、无法闭合引用、IndexedDB 适配层端到端、DOM 事件路径）；
+1. `node --test`：30+ 项规则 / 集成 / 并发 / 页面控制层测试（有效分裂、四个持久化阶段中断恢复、
+   冲突与等价重传、各类拒绝原因、损坏摘要、无法闭合引用、IndexedDB 适配层端到端、
+   两连接并发批次的“双提交健康根 / 仅一个提交另一可重试”回归、DOM 事件路径）；
 2. 页面“构建”：本站为零打包原生 ES 模块，构建 = 结构与引用校验 + 全部 JS `node --check` + 汇总到 `dist/`；
 3. HTTP 冒烟：`/healthz`、`/`、样式与全部 ES 模块资源可达、404 行为。
 
@@ -66,7 +75,7 @@ echo $?                                       # 0 = 规则测试 + 页面构建 
 ## 五、无 Docker 的本机复核（仅需 Node ≥ 20，零依赖）
 
 ```bash
-node --test verify/rules.test.mjs verify/idb.integration.test.mjs verify/dom.test.mjs
+node --test verify/rules.test.mjs verify/idb.integration.test.mjs verify/concurrency.test.mjs verify/dom.test.mjs
 node verify/build.mjs
 PORT=8090 node verify/dev-server.mjs dist &      # 或直接指向 site
 BASE_URL=http://localhost:8090 node verify/smoke.mjs
@@ -85,7 +94,7 @@ site/
     bptree.mjs        阶数 4 B+ 树：路径 COW、分裂、借位、合并
     digest.mjs        FNV-1a 64 位页摘要（UTF-8、稳定 JSON）
     engine.mjs        三阶段提交、断电恢复、回执重放、只读快照与分裂审计
-    store.mjs         IndexedDB 适配（putMany 单事务）+ 内存适配
+    store.mjs         IndexedDB 适配（putMany 单事务 + 提交租约 + 根 CAS）+ 内存适配
 docker/
   Dockerfile.web      nginx 静态站 + 健康检查
   Dockerfile.verify   node:20-alpine 验收容器
@@ -93,8 +102,9 @@ docker/
 verify/
   rules.test.mjs      规则测试
   idb.integration.test.mjs  IndexedDB 适配层端到端（垫片）
+  concurrency.test.mjs      两连接并发批次回执 ↔ 重开一致性回归
   dom.test.mjs        页面控制层事件路径（精简 DOM 垫片）
-  fake-idb.mjs        极简 IndexedDB 垫片
+  fake-idb.mjs        极简 IndexedDB 垫片（事务 FIFO 串行、运行到完成）
   build.mjs / smoke.mjs / dev-server.mjs / run-all.mjs
 docker-compose.yml
 ```
