@@ -1,24 +1,10 @@
 // 极简 IndexedDB 垫片：仅实现站点 IDBStore 用到的 API 面，
-// 供 Node 下验证浏览器适配层与引擎的端到端协作（含单事务 putMany）。
-// 非完整实现，不追求规范边角语义。
+// 供 Node 下验证浏览器适配层与引擎的端到端协作（含单事务 putMany 与条件事务）。
+// 非完整实现，不追求规范边角语义；但同一数据库同时只激活一个事务，
+// 与真实 IndexedDB 中 readwrite 事务相互排他的串行语义一致——
+// “读-改-写”条件事务（并发提交 CAS）因此具备与浏览器一致的原子性。
 
 const tick = () => new Promise((res) => setTimeout(res, 0));
-
-class FakeObjectStore {
-  constructor(map) { this.map = map; }
-  get(key) {
-    return makeRequest(() => (this.map.has(key) ? structuredClone(this.map.get(key)) : undefined));
-  }
-  put(value, key) {
-    return makeRequest(() => { this.map.set(key, structuredClone(value)); return key; });
-  }
-  delete(key) {
-    return makeRequest(() => { this.map.delete(key); return undefined; });
-  }
-  getAllKeys() {
-    return makeRequest(() => [...this.map.keys()]);
-  }
-}
 
 function makeRequest(work) {
   const r = { onsuccess: null, onerror: null, result: undefined, error: null };
@@ -34,29 +20,115 @@ function makeRequest(work) {
   return r;
 }
 
+class FakeObjectStore {
+  constructor(tx) { this.tx = tx; }
+  get(key) {
+    return this.tx._enqueue(() => {
+      const v = this.tx.map.get(key);
+      return v === undefined ? undefined : structuredClone(v);
+    });
+  }
+  put(value, key) {
+    return this.tx._enqueue(() => { this.tx.map.set(key, structuredClone(value)); return key; });
+  }
+  delete(key) {
+    return this.tx._enqueue(() => { this.tx.map.delete(key); return undefined; });
+  }
+  getAllKeys() {
+    return this.tx._enqueue(() => [...this.tx.map.keys()]);
+  }
+}
+
+// 事务：请求按排入顺序逐个执行（各占 1 tick）；全部完成且微任务续体中
+// 无新请求排入时事务完结（对应真实 IDB 的自动提交），随后激活下一个排队事务。
 class FakeTransaction {
-  constructor(map) {
+  constructor(db, map) {
+    this.db = db;
     this.map = map;
+    this.queue = [];
+    this.pending = 0;
+    this.active = false;
+    this.finished = false;
     this.error = null;
     this.oncomplete = null;
     this.onerror = null;
     this.onabort = null;
-    // 真实 IDB 中 complete 事件在本事务全部请求完成后触发；
-    // 请求在同 tick 内排入（各占 1 tick），双 tick 后再发 complete。
-    tick().then(tick).then(() => this.oncomplete?.({ target: this }));
   }
-  objectStore(_name) { return new FakeObjectStore(this.map); }
+  objectStore(_name) { return new FakeObjectStore(this); }
+  _enqueue(work) {
+    const r = { onsuccess: null, onerror: null, result: undefined, error: null };
+    this.queue.push({ work, r });
+    this.pending++;
+    this._pump();
+    return r;
+  }
+  _pump() {
+    if (!this.active || this.finished || this._running) return;
+    const item = this.queue.shift();
+    if (!item) { this._settle(); return; }
+    this._running = true;
+    tick().then(() => {
+      this._running = false;
+      try {
+        item.r.result = item.work();
+        item.r.onsuccess?.({ target: item.r });
+      } catch (e) {
+        item.r.error = e;
+        this.error = this.error ?? e;
+        item.r.onerror?.({ target: item.r });
+      }
+      this.pending--;
+      this._pump();
+      this._settle();
+    });
+  }
+  // 无在途请求时，待微任务续体（可能排入后续请求）全部 drain 后，在下一 tick 判定完结——
+  // 与真实 IDB 一致：complete 以任务形式派发，调用方总能先注册 oncomplete。
+  _settle() {
+    if (this.finished || this.pending > 0 || this.queue.length > 0) return;
+    tick().then(() => {
+      if (this.finished || this.pending > 0 || this.queue.length > 0) return;
+      this.finished = true;
+      if (this.error) this.onabort?.({ target: this });
+      else this.oncomplete?.({ target: this });
+      this.db._release(this);
+    });
+  }
+  abort() {
+    if (this.finished) return;
+    this.finished = true;
+    this.queue.length = 0;
+    this.onabort?.({ target: this });
+    this.db._release(this);
+  }
 }
 
 class FakeDB {
   constructor(maps) {
     this.maps = maps;
     this.objectStoreNames = { contains: (n) => maps.has(n) };
+    this._txQueue = [];
+    this._activeTx = null;
   }
   createObjectStore(name) { this.maps.set(name, new Map()); return {}; }
   transaction(storeNames) {
     const name = Array.isArray(storeNames) ? storeNames[0] : storeNames;
-    return new FakeTransaction(this.maps.get(name));
+    const tx = new FakeTransaction(this, this.maps.get(name));
+    this._txQueue.push(tx);
+    this._pumpTx();
+    return tx;
+  }
+  _pumpTx() {
+    if (this._activeTx || !this._txQueue.length) return;
+    this._activeTx = this._txQueue.shift();
+    this._activeTx.active = true;
+    this._activeTx._pump();
+  }
+  _release(tx) {
+    if (this._activeTx === tx) {
+      this._activeTx = null;
+      this._pumpTx();
+    }
   }
   close() {}
 }

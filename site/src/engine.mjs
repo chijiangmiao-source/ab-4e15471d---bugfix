@@ -6,6 +6,11 @@
 //   意图缺失              -> 查询视图停在旧根，半写入页是不可达孤儿
 //   意图存在且新树可闭合  -> 发布新根（根可完整遍历）
 //   意图存在但页缺失/损坏 -> 保留旧根，剔除未竟意图与孤儿页，给出原因
+// 多连接并发（同一 IndexedDB 被多个页面/连接同时写入）：
+//   阶段2 的意图落盘与阶段3 的根切换都是单事务条件写（store.transact）：
+//   仅当已发布根仍是本批次基线、且无意图或意图属本批次时才放行。
+//   竞争落败者重读新根、重基重试；重试耗尽则返回可重试的冲突回执——
+//   任何 committed 回执都必须对应可恢复、可完整遍历的发布状态。
 
 import {
   applyEdits, buildTree, closure, orderedLeaves, RuleError, ORDER,
@@ -29,6 +34,11 @@ export const MAX_INITIAL = 24;
 export const MAX_EDITS = 12;
 export const MAX_TEXT = 200;
 export const MAX_BATCH_ID = 64;
+
+// 并发提交的重试预算：每次落败（根被推进 / 意图旁落 / 他批意图悬置）重基后再试，
+// 超出预算则返回可重试的冲突回执，绝不虚报 committed
+export const MAX_COMMIT_ATTEMPTS = 12;
+const backoff = (attempt) => new Promise((r) => setTimeout(r, Math.min(8, attempt + 1)));
 
 export function canonicalEdits(edits) {
   return edits.map((e) => {
@@ -147,17 +157,10 @@ export class Engine {
     });
   }
 
-  async recover() {
+  // 读取已发布根与可达页（不做恢复判定），供 recover 与并发重基复用
+  async readPublished() {
     const rootRec = await this.store.get(K_ROOT);
-    const intent = await this.store.get(K_INTENT);
-
-    if (!rootRec) {
-      // 全新库
-      this.state = { rootId: null, gen: 0, pages: new Map(), keySet: new Set(), empty: true, corrupt: [] };
-      if (intent) await this.abandonIntent(intent, '无已发布根却存在意图，丢弃');
-      return this.recoveryReport('FRESH', '空库，尚无已发布根');
-    }
-
+    if (!rootRec) return { rootRec: null, pages: new Map(), loadProblems: [], corrupt: [] };
     const pages = new Map();
     const loadProblems = [];
     try {
@@ -170,6 +173,28 @@ export class Engine {
     for (const p of pages.values()) {
       if (!verifyDigest(p)) corrupt.push(`已发布页 ${p.id} 摘要不匹配`);
     }
+    return { rootRec, pages, loadProblems, corrupt };
+  }
+
+  // 并发重基：其他连接可能已推进已发布根，重新载入后再重试本批次
+  async reloadPublished() {
+    const { rootRec, pages, loadProblems, corrupt } = await this.readPublished();
+    this.state = rootRec
+      ? { rootId: rootRec.rootId, gen: rootRec.gen, pages, keySet: new Set(rootRec.keys ?? []), corrupt, loadProblems }
+      : { rootId: null, gen: 0, pages: new Map(), keySet: new Set(), empty: true, corrupt: [] };
+  }
+
+  async recover() {
+    const intent = await this.store.get(K_INTENT);
+    const { rootRec, pages, loadProblems, corrupt } = await this.readPublished();
+
+    if (!rootRec) {
+      // 全新库
+      this.state = { rootId: null, gen: 0, pages: new Map(), keySet: new Set(), empty: true, corrupt: [] };
+      if (intent) await this.abandonIntent(intent, '无已发布根却存在意图，丢弃');
+      return this.recoveryReport('FRESH', '空库，尚无已发布根');
+    }
+
     const keySet = new Set(rootRec.keys ?? []);
     this.state = { rootId: rootRec.rootId, gen: rootRec.gen, pages, keySet, corrupt, loadProblems };
 
@@ -269,23 +294,31 @@ export class Engine {
     return this.snapshot();
   }
 
-  // 清理指定根不可达的存储页（半写入孤儿 / 旧版本页），返回回收页数
-  async gcUnreachable(keepPages, rootId = this.state.rootId) {
+  // 清理指定根不可达的存储页（半写入孤儿 / 旧版本页），返回回收页数。
+  // keepGenAbove：仅当代次不超过该值的不可达页才被回收——代次更高的不可达页
+  // 可能属于其他连接的在途批次（其提交或后续重开复核会处理它们），不得误删。
+  async gcUnreachable(keepPages, rootId = this.state.rootId, { keepGenAbove = null } = {}) {
     const w = { get: (id) => keepPages.get(id) ?? null, out: new Map() };
     const keep = closure(w, rootId);
     const stored = await this.store.allPageIds();
     let removed = 0;
     for (const pk of stored) {
       const id = pk.slice(5);
-      if (!keep.has(id)) {
-        await this.store.delete(pk);
-        removed++;
+      if (keep.has(id)) continue;
+      if (keepGenAbove != null) {
+        const p = keepPages.get(id) ?? (await this.store.get(pk));
+        if (p && p.gen > keepGenAbove) continue;
       }
+      await this.store.delete(pk);
+      removed++;
     }
     return removed;
   }
 
   // 提交（或重试）一个批次。crashAt 用于复核演练断电中断。
+  // 并发纪律：阶段 2 意图落盘是单事务条件写（已发布根未变且无意图/意图属本批次），
+  // 阶段 3 根切换是单事务条件提交（意图仍属本批次）；竞争落败者重读新根重基重试，
+  // 重试耗尽则返回明确的可重试冲突回执——committed 回执绝不对应丢失键或无法闭合的根。
   // 所有规则违反一律以 rejected 回执返回且不写任何页，绝不抛异常给调用方。
   async submitBatch(rawEdits, batchId, crashAt = CRASH_POINTS.NONE) {
     const editDigest = safeEditDigest(rawEdits);
@@ -297,84 +330,149 @@ export class Engine {
     }
     const edits = canonicalEdits(rawEdits);
 
-    // 同批次重传：等价编辑 -> 回放原回执；内容不同 -> 冲突拒绝
-    const prior = await this.store.get(K_RECEIPT(batchId));
-    if (prior) {
-      if (prior.editDigest !== editDigest) {
-        return rejectReceipt(batchId, editDigest, 'CONFLICT_BATCH_CONTENT',
-          `批次标识 ${batchId} 已用于不同内容的编辑（原摘要 ${prior.editDigest}），拒绝改写历史`);
+    let contention = null; // 最近一次竞争落败原因，重试耗尽后据此给出回执
+    for (let attempt = 0; attempt < MAX_COMMIT_ATTEMPTS; attempt++) {
+      if (attempt > 0) await this.reloadPublished();
+
+      // 同批次重传：等价编辑 -> 回放原回执；内容不同 -> 冲突拒绝
+      const prior = await this.store.get(K_RECEIPT(batchId));
+      if (prior) {
+        if (prior.editDigest !== editDigest) {
+          return rejectReceipt(batchId, editDigest, 'CONFLICT_BATCH_CONTENT',
+            `批次标识 ${batchId} 已用于不同内容的编辑（原摘要 ${prior.editDigest}），拒绝改写历史`);
+        }
+        return { ...prior, replayed: true };
       }
-      return { ...prior, replayed: true };
-    }
 
-    // 已发布树损坏保护：任何批次都不得改变不可信根
-    try {
-      this.verifyPublished();
-    } catch (e) {
-      return rejectReceipt(batchId, editDigest, e.code, e.message);
-    }
+      // 已发布树损坏保护：任何批次都不得改变不可信根
+      try {
+        this.verifyPublished();
+      } catch (e) {
+        return rejectReceipt(batchId, editDigest, e.code, e.message);
+      }
 
-    const intent = await this.store.get(K_INTENT);
-    if (intent && intent.batchId === batchId) {
-      // 上次中断在同批次且尚无回执：等价编辑继续/完成它（走正常三阶段，内容寻址幂等覆盖）
-    } else if (intent) {
-      return rejectReceipt(batchId, editDigest, 'OTHER_BATCH_PENDING',
-        `尚有批次 ${intent.batchId} 未完成恢复判定，请先重开复核`);
-    }
+      // 顾问式预检：他批意图悬置时稍候重试，避免无谓的新页写入；
+      // 真正的并发判定由阶段 2 的单事务条件写完成
+      const pending = await this.store.get(K_INTENT);
+      if (pending && pending.batchId !== batchId) {
+        contention = {
+          code: 'OTHER_BATCH_PENDING',
+          reason: `尚有批次 ${pending.batchId} 未完成恢复判定，请先重开复核`,
+        };
+        await backoff(attempt);
+        continue;
+      }
 
-    const gen = this.state.gen + 1;
-    let result;
-    try {
-      result = applyEdits(this.state.pages, this.state.rootId, gen, edits);
-    } catch (e) {
-      if (e instanceof RuleError) return rejectReceipt(batchId, editDigest, e.code, e.message);
-      throw e;
-    }
-    // applyEdits 成功即代表全部编辑有效；计算提交后的已发布键集合（与根同事务落盘）
-    const nextKeys = [...keysAfter(this.state.keySet ?? new Set(), edits)].sort((a, b) => a - b);
+      const gen = this.state.gen + 1;
+      let result;
+      try {
+        result = applyEdits(this.state.pages, this.state.rootId, gen, edits);
+      } catch (e) {
+        if (e instanceof RuleError) return rejectReceipt(batchId, editDigest, e.code, e.message);
+        throw e;
+      }
+      // applyEdits 成功即代表全部编辑有效；计算提交后的已发布键集合（与根同事务落盘）
+      const nextKeys = [...keysAfter(this.state.keySet ?? new Set(), edits)].sort((a, b) => a - b);
 
-    const newPages = [...result.pages.values()];
-    const intentRec = {
-      batchId, editDigest, gen, rootId: result.rootId, keys: nextKeys,
-      pageIds: newPages.map((p) => p.id), createdAt: this.now(),
-    };
+      const newPages = [...result.pages.values()];
+      const intentRec = {
+        batchId, editDigest, gen, rootId: result.rootId, keys: nextKeys,
+        pageIds: newPages.map((p) => p.id), createdAt: this.now(),
+      };
 
-    // 阶段 1：逐页持久化（崩溃可留下部分半写入页）
-    for (let i = 0; i < newPages.length; i++) {
-      await this.store.put(K_PAGE(newPages[i].id), newPages[i]);
-      if (crashAt === CRASH_POINTS.DURING_PAGES && i === 0) {
+      // 阶段 1：逐页持久化（崩溃可留下部分半写入页）
+      for (let i = 0; i < newPages.length; i++) {
+        await this.store.put(K_PAGE(newPages[i].id), newPages[i]);
+        if (crashAt === CRASH_POINTS.DURING_PAGES && i === 0) {
+          return crashAck(batchId, editDigest, gen, 'PAGES',
+            `断电于新页写入途中：${i + 1}/${newPages.length} 页已落盘，无意图、根未切换`);
+        }
+      }
+      if (crashAt === CRASH_POINTS.AFTER_PAGES) {
         return crashAck(batchId, editDigest, gen, 'PAGES',
-          `断电于新页写入途中：${i + 1}/${newPages.length} 页已落盘，无意图、根未切换`);
+          `断电于新页全部写入后、意图留下前：${newPages.length} 页成为旧根不可达的孤儿候选`);
       }
-    }
-    if (crashAt === CRASH_POINTS.AFTER_PAGES) {
-      return crashAck(batchId, editDigest, gen, 'PAGES',
-        `断电于新页全部写入后、意图留下前：${newPages.length} 页成为旧根不可达的孤儿候选`);
-    }
 
-    // 阶段 2：留下批次意图
-    await this.store.put(K_INTENT, intentRec);
-    if (crashAt === CRASH_POINTS.AFTER_INTENT) {
-      return crashAck(batchId, editDigest, gen, 'INTENT',
-        '断电于意图持久化后、根切换前：重开时凭页与意图证据决定发布或退回');
-    }
+      // 阶段 2：单事务条件落盘意图——已发布根须仍为本批次基线，且无意图或意图属本批次
+      const acquired = await this.store.transact(async (tx) => {
+        const root = await tx.get(K_ROOT);
+        if (!root || root.gen !== this.state.gen || root.rootId !== this.state.rootId) {
+          return { status: 'stale-base' };
+        }
+        const intent = await tx.get(K_INTENT);
+        if (intent && intent.batchId !== batchId) {
+          return { status: 'other-pending', holder: intent.batchId };
+        }
+        await tx.put(K_INTENT, intentRec);
+        return { status: 'ok' };
+      });
+      if (acquired.status === 'stale-base') {
+        // 其他连接已推进已发布根：重基后重试（新键通常落到下一代次）
+        contention = {
+          code: 'CONCURRENT_COMMIT_CONFLICT',
+          reason: '并发提交冲突：已发布根在提交期间被其他连接推进，重基重试仍未胜出，请重试该批次',
+        };
+        continue;
+      }
+      if (acquired.status === 'other-pending') {
+        contention = {
+          code: 'OTHER_BATCH_PENDING',
+          reason: `尚有批次 ${acquired.holder} 未完成恢复判定，请先重开复核`,
+        };
+        await backoff(attempt);
+        continue;
+      }
+      if (crashAt === CRASH_POINTS.AFTER_INTENT) {
+        return crashAck(batchId, editDigest, gen, 'INTENT',
+          '断电于意图持久化后、根切换前：重开时凭页与意图证据决定发布或退回');
+      }
 
-    // 阶段 3：根指针（含键集合）与提交回执在同一事务原子固化（要么都生效要么都不生效）
-    await this.store.putMany([
-      [K_ROOT, { _id: K_ROOT, rootId: result.rootId, gen, keys: nextKeys }],
-      [K_RECEIPT(batchId), committedReceipt(intentRec, this.now())],
-    ]);
-    if (crashAt === CRASH_POINTS.AFTER_ROOT) {
-      return crashAck(batchId, editDigest, gen, 'COMMIT',
-        '断电于根切换后、意图清理前：新根已经是可查询视图，重开仅补清理');
-    }
-    await this.store.delete(K_INTENT);
-    // 回收旧版本页：新根不可达的页一律清除，任何时刻可查询视图只含当前根
-    const combined = this.allPagesAfter(result);
-    await this.gcUnreachable(combined, result.rootId);
+      // 阶段 3：单事务条件提交——意图仍属本批次，才原子切换根指针（含键集合）并固化回执
+      const rootRec = { _id: K_ROOT, rootId: result.rootId, gen, keys: nextKeys };
+      const receiptRec = committedReceipt(intentRec, this.now());
+      const commit = await this.store.transact(async (tx) => {
+        const intent = await tx.get(K_INTENT);
+        if (intent && intent.batchId === batchId) {
+          await tx.put(K_ROOT, rootRec);
+          await tx.put(K_RECEIPT(batchId), receiptRec);
+          return { status: 'committed' };
+        }
+        if (!intent) {
+          // 意图被并发重开的恢复流程处置：若其发布的恰是本批次新根，视同已提交
+          const root = await tx.get(K_ROOT);
+          if (root && root.rootId === rootRec.rootId && root.gen === rootRec.gen) {
+            return { status: 'already-published' };
+          }
+        }
+        return { status: 'lost' };
+      });
+      if (commit.status === 'already-published') {
+        await this.reloadPublished();
+        return { ...receiptRec, replayed: false };
+      }
+      if (commit.status === 'lost') {
+        // 意图已被回滚或取代：重读后由回执回放 / 重基重试裁决
+        contention = {
+          code: 'CONCURRENT_COMMIT_CONFLICT',
+          reason: '并发提交冲突：本批次意图在根切换前被恢复流程处置，请重开复核后重试',
+        };
+        continue;
+      }
+      if (crashAt === CRASH_POINTS.AFTER_ROOT) {
+        return crashAck(batchId, editDigest, gen, 'COMMIT',
+          '断电于根切换后、意图清理前：新根已经是可查询视图，重开仅补清理');
+      }
+      await this.store.delete(K_INTENT);
+      // 回收旧版本页：仅回收代次不超过新根的不可达页；代次更高的不可达页可能属于
+      // 其他连接的在途批次，留给其提交后的回收或重开复核处理，任何时刻可查询视图只含当前根
+      const combined = this.allPagesAfter(result);
+      await this.gcUnreachable(combined, result.rootId, { keepGenAbove: gen });
 
-    this.state = { rootId: result.rootId, gen, pages: combined, keySet: new Set(nextKeys), corrupt: [], loadProblems: [] };
-    return { ...committedReceipt(intentRec, this.now()), replayed: false };
+      this.state = { rootId: result.rootId, gen, pages: combined, keySet: new Set(nextKeys), corrupt: [], loadProblems: [] };
+      return { ...receiptRec, replayed: false };
+    }
+    // 重试耗尽：明确返回可重试的冲突结果，绝不虚报 committed
+    return rejectReceipt(batchId, editDigest, contention.code, contention.reason);
   }
 
   allPagesAfter(result) {

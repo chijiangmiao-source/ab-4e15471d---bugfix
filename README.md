@@ -56,8 +56,9 @@ echo $?                                       # 0 = 规则测试 + 页面构建 
 `verify` 容器位于 `verify` profile 下（故普通 `docker compose up` 只启动站点），
 在 `web` 健康后运行（`depends_on: service_healthy`）：
 
-1. `node --test`：26+ 项规则 / 集成 / 页面控制层测试（有效分裂、四个持久化阶段中断恢复、
-   冲突与等价重传、各类拒绝原因、损坏摘要、无法闭合引用、IndexedDB 适配层端到端、DOM 事件路径）；
+1. `node --test`：29+ 项规则 / 集成 / 并发 / 页面控制层测试（有效分裂、四个持久化阶段中断恢复、
+   冲突与等价重传、各类拒绝原因、损坏摘要、无法闭合引用、IndexedDB 适配层端到端、
+   多连接并发批次回执与重开视图一致性、DOM 事件路径）；
 2. 页面“构建”：本站为零打包原生 ES 模块，构建 = 结构与引用校验 + 全部 JS `node --check` + 汇总到 `dist/`；
 3. HTTP 冒烟：`/healthz`、`/`、样式与全部 ES 模块资源可达、404 行为。
 
@@ -66,7 +67,7 @@ echo $?                                       # 0 = 规则测试 + 页面构建 
 ## 五、无 Docker 的本机复核（仅需 Node ≥ 20，零依赖）
 
 ```bash
-node --test verify/rules.test.mjs verify/idb.integration.test.mjs verify/dom.test.mjs
+node --test verify/rules.test.mjs verify/idb.integration.test.mjs verify/concurrency.test.mjs verify/dom.test.mjs
 node verify/build.mjs
 PORT=8090 node verify/dev-server.mjs dist &      # 或直接指向 site
 BASE_URL=http://localhost:8090 node verify/smoke.mjs
@@ -93,6 +94,7 @@ docker/
 verify/
   rules.test.mjs      规则测试
   idb.integration.test.mjs  IndexedDB 适配层端到端（垫片）
+  concurrency.test.mjs      多连接并发批次：回执与重开视图一致性回归
   dom.test.mjs        页面控制层事件路径（精简 DOM 垫片）
   fake-idb.mjs        极简 IndexedDB 垫片
   build.mjs / smoke.mjs / dev-server.mjs / run-all.mjs
@@ -107,4 +109,10 @@ docker-compose.yml
   避免写时复制下叶间链在分裂 / 合并时的脆弱维护。
 - **“恰好一次”如何独立证明**：树遍历结果与根记录中随根原子提交的键集合双向比对，
   任何分裂丢键 / 重复都会在结果页暴露。
+- **多连接并发提交为何不虚报回执**：阶段 2 意图落盘与阶段 3 根切换均为**单事务条件写**
+  （`store.transact`）：仅当已发布根仍是本批次基线、且无意图或意图属本批次时才放行。
+  竞争落败者重读新根、重基重试（两个批次都成功时按串行顺序落到相邻代次，通常推进到第 3 代）；
+  重试耗尽则返回 `OTHER_BATCH_PENDING` / `CONCURRENT_COMMIT_CONFLICT` 可重试回执。
+  提交后的页回收只清除代次不超过新根的不可达页，在途批次的新页不受波及——
+  任何 `committed` 回执都对应可恢复、可完整遍历的发布状态。
 - 摘要为 FNV-1a 64 位，用于检测意外损坏 / 篡改，不提供密码学抗碰撞保证。
